@@ -16,8 +16,10 @@ def main(config: DictConfig):
 
     if train_dataset is None:
         raise ValueError(
-            "Training dataset not found! Please run prepare_math_data.py first:\n"
-            "  python examples/solver_judge_distill/prepare_math_data.py"
+            "Training dataset not found! Please run a prepare script first:\n"
+            "  python examples/solver_judge_distill/prepare_math_data.py\n"
+            "  or for OPSD with OpenThoughts:\n"
+            "  python examples/solver_judge_distill/prepare_openthoughts_math_data.py"
         )
 
     # Create trainer with SimpleMathWorkflow (1 trajectory per episode)

@@ -13,6 +13,7 @@ import torch
 from tinker.types.tensor_data import TensorData
 
 from rllm.agents.agent import Step, Trajectory
+from rllm.workflows.workflow import TerminationReason
 
 logger = logging.getLogger(__name__)
 
@@ -555,6 +556,7 @@ async def process_episodes(
     # Track metrics
     all_advantages = []
     group_sizes = []
+    distill_length_exceeded_filtered = 0
 
     training_datums = []
 
@@ -568,14 +570,14 @@ async def process_episodes(
                 raise ValueError("Teacher engine does not have a chat_parser.")
             teacher_chat_parser = advantage_computer.teacher_engine.chat_parser
 
-        async def process_step(global_idx: int, step: Step, ground_truth: str = None) -> tuple[tinker.Datum, float] | None:
+        async def process_step(global_idx: int, step: Step, teacher_reference: str = None) -> tuple[tinker.Datum, float] | None:
             """
             Process a single step: query teacher, align, compute advantages, build datum.
 
             Args:
                 global_idx: Global step index (for visualization on idx=0)
                 step: The step to process
-                ground_truth: Optional ground truth answer for OPSD-style answer conditioning
+                teacher_reference: For OPSD: full solution (OpenThoughts) or ground_truth answer (Polaris)
 
             Returns:
                 Tuple of (datum, avg_advantage) or None if step should be skipped
@@ -591,7 +593,7 @@ async def process_episodes(
             student_logprobs = step.model_output.logprobs
 
             # Check if we need answer conditioning (OPSD-style self-distillation)
-            use_answer_conditioning = advantage_computer.condition_teacher_on_answer and ground_truth is not None
+            use_answer_conditioning = advantage_computer.condition_teacher_on_answer and teacher_reference is not None
 
             if advantage_computer.shared_tokenizer and not use_answer_conditioning:
                 # Fast path: student and teacher use the same tokenizer AND no answer conditioning
@@ -614,11 +616,12 @@ async def process_episodes(
                 teacher_prompt_messages = []
                 for i, msg in enumerate(student_prompt_messages):
                     if i == len(student_prompt_messages) - 1 and msg.get("role") == "user":
-                        # Append ground truth to the last user message
+                        # Append teacher reference to the last user message
+                        # Use full solution (OpenThoughts) when available, else ground_truth (Polaris)
                         original_content = msg.get("content", "")
                         answer_conditioned_content = (
                             f"{original_content}\n\n"
-                            f"The correct answer is: {ground_truth}\n\n"
+                            f"The reference solution is:\n\n{teacher_reference}\n\n"
                             f"Explain the solution step by step."
                         )
                         teacher_prompt_messages.append({**msg, "content": answer_conditioned_content})
@@ -650,7 +653,7 @@ async def process_episodes(
                     import logging
                     _logger = logging.getLogger(__name__)
                     _logger.info(
-                        f"[OPSD Answer Conditioning] Teacher prompt modified with ground_truth='{ground_truth}'. "
+                        f"[OPSD] Teacher prompt modified with reference ({len(teacher_reference)} chars). "
                         f"Teacher prompt length: {teacher_prompt_len}, student completion length: {len(student_completion_ids)}"
                     )
 
@@ -672,7 +675,7 @@ async def process_episodes(
                             original_content = msg.get("content", "")
                             answer_conditioned_content = (
                                 f"{original_content}\n\n"
-                                f"The correct answer is: {ground_truth}\n\n"
+                                f"The reference solution is:\n\n{teacher_reference}\n\n"
                                 f"Explain the solution step by step."
                             )
                             modified_teacher_prompt_messages.append({**msg, "content": answer_conditioned_content})
@@ -687,8 +690,8 @@ async def process_episodes(
                     import logging
                     _logger = logging.getLogger(__name__)
                     _logger.warning(
-                        f"Skipping step with empty teacher response (no reasoning or content). "
-                        f"This may indicate a teacher model timeout or error."
+                        "Skipping step with empty teacher response (no reasoning or content). "
+                        "This may indicate a teacher model timeout or error."
                     )
                     return None  # Return None (not tuple) so filtering works correctly
 
@@ -764,25 +767,45 @@ async def process_episodes(
             avg_advantage = float(np.mean(advantages)) if advantages else 0.0
             return datum, avg_advantage
 
-        # Collect all steps with their ground truth (for answer conditioning)
+        # Collect all steps with teacher reference (for OPSD answer/solution conditioning)
+        # Prefer full solution (OpenThoughts) over ground_truth (Polaris)
+        # Filter out length-exceeded episodes to avoid training on truncated (usually wrong) outputs
+        filter_length_exceeded = algorithm_config.get("filter_length_exceeded_for_distill", True)
         all_steps_with_task: list[tuple[Step, str | None]] = []
         for episode in episodes:
-            # Extract ground truth from episode task
-            ground_truth = None
+            if filter_length_exceeded and episode.termination_reason == TerminationReason.MAX_RESPONSE_LENGTH_EXCEEDED:
+                distill_length_exceeded_filtered += 1
+                continue
+
+            teacher_reference = None
             if episode.task and isinstance(episode.task, dict):
+                solution = episode.task.get("solution")
                 ground_truth = episode.task.get("ground_truth")
-            
+                teacher_reference = solution if solution else ground_truth
+
             for trajectory in episode.trajectories:
                 for step in trajectory.steps:
-                    all_steps_with_task.append((step, ground_truth))
+                    all_steps_with_task.append((step, teacher_reference))
+
+        if distill_length_exceeded_filtered > 0:
+            logger.info(
+                f"[Distillation] Filtered {distill_length_exceeded_filtered}/{len(episodes)} length-exceeded episodes. "
+                f"Processing {len(all_steps_with_task)} steps from {len(episodes) - distill_length_exceeded_filtered} episodes."
+            )
+
+        if not all_steps_with_task:
+            logger.warning(
+                "All episodes were filtered out (length-exceeded or empty). No training data for this batch."
+            )
+            return [], {"distill/length_exceeded_filtered": distill_length_exceeded_filtered}
 
         import time
 
         start_time = time.time()
         print(f"[Distillation] Processing {len(all_steps_with_task)} steps in parallel...")
 
-        # Process all steps in parallel (passing ground_truth for answer conditioning)
-        tasks = [process_step(idx, step, ground_truth) for idx, (step, ground_truth) in enumerate(all_steps_with_task)]
+        # Process all steps in parallel (passing teacher_reference for OPSD)
+        tasks = [process_step(idx, step, ref) for idx, (step, ref) in enumerate(all_steps_with_task)]
         results = await asyncio.gather(*tasks)
 
         print(f"[Distillation] Processing complete in {time.time() - start_time:.2f} seconds.")
@@ -798,16 +821,12 @@ async def process_episodes(
             all_advantages.append(avg_advantage)
         
         if skipped_count > 0:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.warning(
                 f"Skipped {skipped_count}/{len(results)} steps due to empty teacher responses. "
                 f"Proceeding with {len(training_datums)} valid steps."
             )
         
         if len(training_datums) == 0:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.error(
                 "All steps were skipped due to empty teacher responses. "
                 "This batch cannot be processed. Check teacher model connectivity/health."
@@ -887,6 +906,9 @@ async def process_episodes(
         metrics["advantage/max"] = np.max(all_advantages)
         metrics["advantage/min"] = np.min(all_advantages)
         metrics["advantage/fraction_zero"] = np.sum(np.abs(all_advantages) < 1e-8) / len(all_advantages)
+
+    if advantage_computer.distill_enabled and distill_length_exceeded_filtered > 0:
+        metrics["distill/length_exceeded_filtered"] = distill_length_exceeded_filtered
 
     return training_datums, metrics
 

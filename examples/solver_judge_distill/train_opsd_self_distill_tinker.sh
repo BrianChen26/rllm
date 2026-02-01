@@ -1,8 +1,7 @@
 set -x
 
-# OPSD-style Self-Distillation: Same model as both student and teacher
-# Teacher is conditioned on ground truth answer to provide better signal
-# Key: algorithm.condition_teacher_on_answer=True
+# OPSD with OpenThoughts (full chain-of-thought solutions for teacher conditioning)
+# Run prepare_openthoughts_math_data.py before training
 
 python -m examples.solver_judge_distill.train_simple_math_distill_tinker \
     model.name=Qwen/Qwen3-4B-Instruct-2507 \
@@ -27,11 +26,11 @@ python -m examples.solver_judge_distill.train_simple_math_distill_tinker \
     trainer.total_epochs=100 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='solver-judge-distill' \
-    trainer.experiment_name='opsd-self-distill-4b-instruct' \
+    trainer.experiment_name='opsd-openthoughts-4b-instruct' \
     trainer.val_before_train=True \
     trainer.test_freq=10 \
     trainer.save_freq=20 \
-    trainer.default_local_dir='./outputs/opsd-self-distill-4b-instruct' \
+    trainer.default_local_dir='./outputs/opsd-openthoughts-4b-instruct' \
     rollout_engine.bypass_render_with_parser=True \
     rollout_engine.disable_thinking=False \
     workflow.n_parallel_tasks=256 \
