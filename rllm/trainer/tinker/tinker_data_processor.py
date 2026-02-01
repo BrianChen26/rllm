@@ -54,6 +54,8 @@ class TinkerAdvantageComputer:
         self.clip_advantages = algorithm_config.get("clip_advantages", False)
         self.adv_clip_min = algorithm_config.get("adv_clip_min", -5.0)
         self.adv_clip_max = algorithm_config.get("adv_clip_max", 5.0)
+        # OPSD-style: condition teacher on ground truth answer for self-distillation
+        self.condition_teacher_on_answer = algorithm_config.get("condition_teacher_on_answer", False)
 
     def compute_grpo_advantages(self, group_rewards: list[float]) -> list[float]:
         """
@@ -560,18 +562,20 @@ async def process_episodes(
         import asyncio
 
         teacher_chat_parser = None
-        if not advantage_computer.shared_tokenizer:
+        # For answer conditioning OR different tokenizers, we need the chat parser
+        if advantage_computer.condition_teacher_on_answer or not advantage_computer.shared_tokenizer:
             if not hasattr(advantage_computer.teacher_engine, "chat_parser") or advantage_computer.teacher_engine.chat_parser is None:
                 raise ValueError("Teacher engine does not have a chat_parser.")
             teacher_chat_parser = advantage_computer.teacher_engine.chat_parser
 
-        async def process_step(global_idx: int, step: Step) -> tuple[tinker.Datum, float] | None:
+        async def process_step(global_idx: int, step: Step, ground_truth: str = None) -> tuple[tinker.Datum, float] | None:
             """
             Process a single step: query teacher, align, compute advantages, build datum.
 
             Args:
                 global_idx: Global step index (for visualization on idx=0)
                 step: The step to process
+                ground_truth: Optional ground truth answer for OPSD-style answer conditioning
 
             Returns:
                 Tuple of (datum, avg_advantage) or None if step should be skipped
@@ -586,16 +590,72 @@ async def process_episodes(
             student_completion_ids = step.model_output.completion_ids
             student_logprobs = step.model_output.logprobs
 
-            if advantage_computer.shared_tokenizer:
-                # Fast path: student and teacher use the same tokenizer
+            # Check if we need answer conditioning (OPSD-style self-distillation)
+            use_answer_conditioning = advantage_computer.condition_teacher_on_answer and ground_truth is not None
+
+            if advantage_computer.shared_tokenizer and not use_answer_conditioning:
+                # Fast path: student and teacher use the same tokenizer AND no answer conditioning
                 # Directly use student token IDs for teacher query
                 teacher_ids = student_prompt_ids + student_completion_ids
                 teacher_prompt_length = len(student_prompt_ids)
                 teacher_full_logprobs = await advantage_computer.teacher_engine.compute_logprobs(teacher_ids)
                 aligned_teacher_logprobs = teacher_full_logprobs[teacher_prompt_length:]
 
+            elif use_answer_conditioning and advantage_computer.shared_tokenizer:
+                # OPSD-style answer conditioning with shared tokenizer
+                # Teacher sees: problem + ground truth answer, but we score the student's raw completion tokens
+                if not step.chat_completions:
+                    raise ValueError("Missing chat_completions in step for answer-conditioned distillation.")
+
+                # Get the original student prompt messages (all messages except the last assistant response)
+                student_prompt_messages = step.chat_completions[:-1]
+
+                # Modify the teacher prompt to include the ground truth answer
+                teacher_prompt_messages = []
+                for i, msg in enumerate(student_prompt_messages):
+                    if i == len(student_prompt_messages) - 1 and msg.get("role") == "user":
+                        # Append ground truth to the last user message
+                        original_content = msg.get("content", "")
+                        answer_conditioned_content = (
+                            f"{original_content}\n\n"
+                            f"The correct answer is: {ground_truth}\n\n"
+                            f"Explain the solution step by step."
+                        )
+                        teacher_prompt_messages.append({**msg, "content": answer_conditioned_content})
+                    else:
+                        teacher_prompt_messages.append(msg)
+
+                # Build teacher prompt with answer conditioning
+                teacher_prompt = teacher_chat_parser.parse(
+                    teacher_prompt_messages,
+                    is_first_msg=True,
+                    add_generation_prompt=True,
+                    tools=[],
+                    accumulate_reasoning=False,
+                )
+                teacher_prompt_ids = advantage_computer.teacher_tokenizer.encode(teacher_prompt, add_special_tokens=False)
+
+                # Use student's raw completion IDs directly (not re-parsed through chat template)
+                # This ensures teacher logprobs align with student logprobs token-by-token
+                # The student_completion_ids are already the raw tokens the student generated
+                teacher_ids = teacher_prompt_ids + student_completion_ids
+                teacher_full_logprobs = await advantage_computer.teacher_engine.compute_logprobs(teacher_ids)
+
+                teacher_prompt_len = len(teacher_prompt_ids)
+                # Since same tokenizer and using raw student completion IDs, lengths should match exactly
+                aligned_teacher_logprobs = teacher_full_logprobs[teacher_prompt_len:]
+
+                # Log first step for debugging
+                if global_idx == 0:
+                    import logging
+                    _logger = logging.getLogger(__name__)
+                    _logger.info(
+                        f"[OPSD Answer Conditioning] Teacher prompt modified with ground_truth='{ground_truth}'. "
+                        f"Teacher prompt length: {teacher_prompt_len}, student completion length: {len(student_completion_ids)}"
+                    )
+
             else:
-                # Slow path: different tokenizers, need byte-level alignment
+                # Different tokenizers path (original behavior, with or without answer conditioning)
                 from rllm.trainer.distill import align_teacher_logprobs
 
                 if not step.chat_completions:
@@ -604,14 +664,29 @@ async def process_episodes(
                 teacher_prompt_messages = step.chat_completions[:-1]
                 teacher_completion_messages = step.chat_completions[-1:]
 
+                # If answer conditioning is enabled, modify teacher prompt
+                if use_answer_conditioning:
+                    modified_teacher_prompt_messages = []
+                    for i, msg in enumerate(teacher_prompt_messages):
+                        if i == len(teacher_prompt_messages) - 1 and msg.get("role") == "user":
+                            original_content = msg.get("content", "")
+                            answer_conditioned_content = (
+                                f"{original_content}\n\n"
+                                f"The correct answer is: {ground_truth}\n\n"
+                                f"Explain the solution step by step."
+                            )
+                            modified_teacher_prompt_messages.append({**msg, "content": answer_conditioned_content})
+                        else:
+                            modified_teacher_prompt_messages.append(msg)
+                    teacher_prompt_messages = modified_teacher_prompt_messages
+
                 reasoning_str = teacher_completion_messages[0].get("reasoning", "")
                 content_str = teacher_completion_messages[0].get("content", "")
                 if not reasoning_str and not content_str:
                     # Skip steps where teacher returned empty response (likely due to timeout/error)
-                    # Log warning and return None to skip this step
                     import logging
-                    logger = logging.getLogger(__name__)
-                    logger.warning(
+                    _logger = logging.getLogger(__name__)
+                    _logger.warning(
                         f"Skipping step with empty teacher response (no reasoning or content). "
                         f"This may indicate a teacher model timeout or error."
                     )
@@ -635,7 +710,7 @@ async def process_episodes(
                     accumulate_reasoning=True,
                 )
                 if teacher_completion.startswith(teacher_chat_parser.generation_prompt):
-                    teacher_completion = teacher_completion[len(teacher_chat_parser.generation_prompt) :]
+                    teacher_completion = teacher_completion[len(teacher_chat_parser.generation_prompt):]
                 teacher_completion_ids = advantage_computer.teacher_tokenizer.encode(teacher_completion, add_special_tokens=False)
 
                 # Query teacher for logprobs (async)
@@ -689,20 +764,25 @@ async def process_episodes(
             avg_advantage = float(np.mean(advantages)) if advantages else 0.0
             return datum, avg_advantage
 
-        # Collect all steps
-        all_steps: list[Step] = []
+        # Collect all steps with their ground truth (for answer conditioning)
+        all_steps_with_task: list[tuple[Step, str | None]] = []
         for episode in episodes:
+            # Extract ground truth from episode task
+            ground_truth = None
+            if episode.task and isinstance(episode.task, dict):
+                ground_truth = episode.task.get("ground_truth")
+            
             for trajectory in episode.trajectories:
                 for step in trajectory.steps:
-                    all_steps.append(step)
+                    all_steps_with_task.append((step, ground_truth))
 
         import time
 
         start_time = time.time()
-        print(f"[Distillation] Processing {len(all_steps)} steps in parallel...")
+        print(f"[Distillation] Processing {len(all_steps_with_task)} steps in parallel...")
 
-        # Process all steps in parallel
-        tasks = [process_step(idx, step) for idx, step in enumerate(all_steps)]
+        # Process all steps in parallel (passing ground_truth for answer conditioning)
+        tasks = [process_step(idx, step, ground_truth) for idx, (step, ground_truth) in enumerate(all_steps_with_task)]
         results = await asyncio.gather(*tasks)
 
         print(f"[Distillation] Processing complete in {time.time() - start_time:.2f} seconds.")
