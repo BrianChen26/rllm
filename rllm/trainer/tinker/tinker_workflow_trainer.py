@@ -141,13 +141,36 @@ class TinkerWorkflowTrainer(TinkerAgentTrainer):
         all_episode_metrics = {}  # episode_id -> episode.metrics dict
         val_group_size = self.config.training.get('val_group_size', 1)
         self.agent_execution_engine.rollout_engine.set_sampling_client(sampling_client)
-        for batch in dataloader:
-            batch = self.build_interleave_batch(batch, val_group_size)
-            self.init_envs_and_agents(batch)
-            # For validation, collect all episodes from generator
-            async for episodes, episode_metrics in self.generate_agent_episodes(group_size=val_group_size, minibatch_size=1, return_metrics=True):
-                all_episodes.extend(episodes)
-                all_episode_metrics.update(episode_metrics)
+
+        # Use separate max_response_length for validation if configured (e.g. 32000 vs 2048 for training)
+        rollout_engine = self.agent_execution_engine.rollout_engine
+        val_max_response_length = self.config.data.get("max_response_length_val") or self.config.data.max_response_length
+        original_max_response_length = rollout_engine.max_response_length
+        original_sampling_params = rollout_engine.sampling_params
+        if val_max_response_length != original_max_response_length:
+            rollout_engine.max_response_length = val_max_response_length
+            # Create new SamplingParams since it's a frozen Pydantic model
+            import tinker
+            rollout_engine.sampling_params = tinker.types.SamplingParams(
+                max_tokens=val_max_response_length,
+                stop=original_sampling_params.stop,
+                temperature=original_sampling_params.temperature,
+                top_p=original_sampling_params.top_p,
+            )
+            logger.info(f"Validation: using max_response_length={val_max_response_length} (training uses {original_max_response_length})")
+
+        try:
+            for batch in dataloader:
+                batch = self.build_interleave_batch(batch, val_group_size)
+                self.init_envs_and_agents(batch)
+                # For validation, collect all episodes from generator
+                async for episodes, episode_metrics in self.generate_agent_episodes(group_size=val_group_size, minibatch_size=1, return_metrics=True):
+                    all_episodes.extend(episodes)
+                    all_episode_metrics.update(episode_metrics)
+        finally:
+            if val_max_response_length != original_max_response_length:
+                rollout_engine.max_response_length = original_max_response_length
+                rollout_engine.sampling_params = original_sampling_params
 
         # Collect workflow metrics per episode (deduplicated by episode.id)
         # all_episode_metrics is: {episode_id: {metric_name: metric_value, ...}, ...}

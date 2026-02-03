@@ -619,10 +619,12 @@ async def process_episodes(
                         # Append teacher reference to the last user message
                         # Use full solution (OpenThoughts) when available, else ground_truth (Polaris)
                         original_content = msg.get("content", "")
+                        # OPSD paper format (Figure 2): encourage teacher to rationalize the solution
                         answer_conditioned_content = (
-                            f"{original_content}\n\n"
-                            f"The reference solution is:\n\n{teacher_reference}\n\n"
-                            f"Explain the solution step by step."
+                            f"Problem: {original_content}\n"
+                            f"Here is a reference solution:\n{teacher_reference}\n"
+                            f"After understanding the reference solution, please try to solve this problem using your own approach below:\n"
+                            f"Answer:"
                         )
                         teacher_prompt_messages.append({**msg, "content": answer_conditioned_content})
                     else:
@@ -673,10 +675,12 @@ async def process_episodes(
                     for i, msg in enumerate(teacher_prompt_messages):
                         if i == len(teacher_prompt_messages) - 1 and msg.get("role") == "user":
                             original_content = msg.get("content", "")
+                            # OPSD paper format (Figure 2): encourage teacher to rationalize the solution
                             answer_conditioned_content = (
-                                f"{original_content}\n\n"
-                                f"The reference solution is:\n\n{teacher_reference}\n\n"
-                                f"Explain the solution step by step."
+                                f"Problem: {original_content}\n"
+                                f"Here is a reference solution:\n{teacher_reference}\n"
+                                f"After understanding the reference solution, please try to solve this problem using your own approach below:\n"
+                                f"Answer:"
                             )
                             modified_teacher_prompt_messages.append({**msg, "content": answer_conditioned_content})
                         else:

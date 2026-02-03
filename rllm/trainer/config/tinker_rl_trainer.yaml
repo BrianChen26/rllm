@@ -74,6 +74,7 @@ data:
   val_files: null
   max_prompt_length: 2048
   max_response_length: 2048
+  max_response_length_val: null  # If set, use for validation (e.g. 16384); else same as max_response_length
   train_batch_size: 64
   val_batch_size: 32
 
