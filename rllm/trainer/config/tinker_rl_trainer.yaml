@@ -19,6 +19,8 @@ training:
   group_size: 16  # Number of rollouts per prompt (for GRPO)
   val_group_size: 1  # Number of rollouts per validation prompt
   learning_rate: 2e-5  # 2e-5 for MATH dataset
+  warmup_ratio: 0.0  # If > 0, linear warmup for first warmup_ratio of steps (e.g. 0.1 = 10%)
+  lr_scheduler: constant  # "constant" or "cosine" - cosine decays LR to 0 after warmup
   beta1: 0.9
   beta2: 0.95
   eps: 1e-8

@@ -5,10 +5,12 @@ set -x
 
 python -m examples.solver_judge_distill.train_simple_math_distill_tinker \
     model.name=Qwen/Qwen3-8B \
-    model.lora_rank=32 \
+    model.lora_rank=64 \
     training.group_size=1 \
     training.val_group_size=16 \
     training.learning_rate=2e-5 \
+    training.warmup_ratio=0.1 \
+    training.lr_scheduler=cosine \
     sampling.temperature=1.0 \
     sampling.top_p=1.0 \
     algorithm.adv_estimator=distill \

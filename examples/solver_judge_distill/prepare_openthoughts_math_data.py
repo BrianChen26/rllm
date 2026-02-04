@@ -49,6 +49,9 @@ def prepare_openthoughts_math_data():
     )
     # Filter out examples without valid solution (needed for OPSD teacher conditioning)
     train_dataset = train_dataset.filter(lambda x: bool(x.get("solution", "").strip()))
+    # Limit to 30K to match OPSD paper (Table 6: "Training Dataset Size 30k")
+    if len(train_dataset) > 30000:
+        train_dataset = train_dataset.select(range(30000))
     test_dataset1 = test_dataset1.map(
         preprocess_aime, with_indices=True, remove_columns=test_dataset1.column_names
     )

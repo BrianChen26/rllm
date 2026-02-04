@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -35,6 +36,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
+
+
+def _get_scheduled_lr(
+    base_lr: float,
+    step: int,
+    total_steps: int,
+    warmup_ratio: float = 0.0,
+    lr_scheduler: str = "constant",
+) -> float:
+    """Compute scheduled learning rate (warmup + optional cosine decay). Defaults return base_lr."""
+    if total_steps is None or total_steps <= 0:
+        return base_lr
+    if warmup_ratio <= 0 and lr_scheduler == "constant":
+        return base_lr
+    warmup_steps = int(total_steps * warmup_ratio) if warmup_ratio > 0 else 0
+    if step < warmup_steps:
+        return base_lr * (step / warmup_steps) if warmup_steps > 0 else base_lr
+    if lr_scheduler == "cosine":
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+    return base_lr
 
 
 class TinkerAgentTrainer:
@@ -158,14 +180,21 @@ class TinkerAgentTrainer:
         batch_idx = start_batch
         logger.info(f"Starting training loop with batch_idx={batch_idx}, start_batch={start_batch}")
 
-        learning_rate = self.config.training.learning_rate
+        base_learning_rate = self.config.training.learning_rate
         beta1 = self.config.training.beta1
         beta2 = self.config.training.beta2
         eps = self.config.training.eps
+        warmup_ratio = self.config.training.get("warmup_ratio", 0.0) or 0.0
+        lr_scheduler = self.config.training.get("lr_scheduler", "constant") or "constant"
 
         # Calculate total batches for progress tracking
         if self.train_dataloader and hasattr(self.train_dataloader, "__len__"):
             self.num_train_batches = len(self.train_dataloader)
+        total_steps = (
+            self.num_train_batches * self.config.trainer.total_epochs
+            if getattr(self, "num_train_batches", None)
+            else None
+        )
 
         # Track global batch number across all epochs
         batches_processed = 0
@@ -204,6 +233,11 @@ class TinkerAgentTrainer:
                 minibatch_count = 0
                 forward_backward_times = []
 
+                # Compute scheduled LR (warmup + optional cosine) - defaults to constant for other users
+                scheduled_lr = _get_scheduled_lr(
+                    base_learning_rate, batch_idx - start_batch, total_steps, warmup_ratio, lr_scheduler
+                )
+
                 # Stream: train on each minibatch as it arrives
                 train_step_start = time.time()
                 all_grouping_metrics = []
@@ -224,7 +258,7 @@ class TinkerAgentTrainer:
 
                     # Train immediately (streaming), only optimize on last minibatch
                     t_train_start = time.time()
-                    logprobs, datums, grouping_metrics = await self.trainer.step(minibatch_episodes, learning_rate=learning_rate, beta1=beta1, beta2=beta2, eps=eps, optimizer_step=False)
+                    logprobs, datums, grouping_metrics = await self.trainer.step(minibatch_episodes, learning_rate=scheduled_lr, beta1=beta1, beta2=beta2, eps=eps, optimizer_step=False)
                     forward_backward_times.append(time.time() - t_train_start)
                     training_logprobs.extend(logprobs)
                     training_datums.extend(datums)
@@ -232,7 +266,7 @@ class TinkerAgentTrainer:
                     logger.info(f"Processed minibatch {minibatch_count}/{num_minibatches} with {len(minibatch_episodes)} episodes")
 
                 optim_step_time = time.time()
-                optim_step_future = await self.trainer.optim_step_future(learning_rate=learning_rate, beta1=beta1, beta2=beta2, eps=eps)
+                optim_step_future = await self.trainer.optim_step_future(learning_rate=scheduled_lr, beta1=beta1, beta2=beta2, eps=eps)
                 await optim_step_future.result_async()
                 time_metrics["time/optim_step"] = time.time() - optim_step_time
                 time_metrics["time/forward_backward"] = sum(forward_backward_times)
@@ -249,7 +283,7 @@ class TinkerAgentTrainer:
                     episodes=episodes,
                     batch_idx=batch_idx,
                     time_metrics=time_metrics,
-                    learning_rate=learning_rate,
+                    learning_rate=scheduled_lr,
                     total_batches=total_batches,
                     epoch=epoch,
                     training_datums=training_datums,  # Pass datums for KL/perplexity metrics
